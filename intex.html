@@ -1,0 +1,54 @@
+-- Run this once in Supabase: SQL Editor > New query > paste > Run
+
+create table settings (
+  id int primary key default 1 check (id = 1),
+  upi text, payee text
+);
+create table admins (user_id uuid primary key references auth.users on delete cascade);
+create table students (
+  id uuid primary key default gen_random_uuid(),
+  roll text unique not null,
+  name text not null,
+  class text,
+  amount numeric not null check (amount > 0),
+  access_code text not null default substr(md5(random()::text || clock_timestamp()::text), 1, 8),
+  user_id uuid unique references auth.users on delete set null,
+  paid boolean not null default false,
+  paid_on timestamptz
+);
+
+alter table settings enable row level security;
+alter table admins enable row level security;
+alter table students enable row level security;
+
+create function is_admin() returns boolean
+language sql security definer set search_path = public stable
+as $$ select exists (select 1 from admins where user_id = auth.uid()) $$;
+
+-- Student links own login to their record using roll number + private access code
+create function claim_student(p_roll text, p_code text) returns void
+language plpgsql security definer set search_path = public
+as $$
+begin
+  update students set user_id = auth.uid()
+  where roll = p_roll and access_code = p_code and user_id is null
+    and not exists (select 1 from students where user_id = auth.uid());
+  if not found then raise exception 'Invalid roll number or code, or already linked'; end if;
+end $$;
+
+revoke all on function is_admin(), claim_student(text, text) from public, anon;
+grant execute on function is_admin(), claim_student(text, text) to authenticated;
+
+-- Settings: any logged-in user can read (needed to pay); only admin can change
+create policy "settings read" on settings for select to authenticated using (true);
+create policy "settings admin" on settings for all to authenticated
+  using (is_admin()) with check (is_admin());
+
+-- Students: a student sees ONLY their own row; admin sees and edits all
+create policy "students read" on students for select to authenticated
+  using (user_id = auth.uid() or is_admin());
+create policy "students admin write" on students for all to authenticated
+  using (is_admin()) with check (is_admin());
+
+-- AFTER you create your own admin login in the app, run this with YOUR email:
+-- insert into admins select id from auth.users where email = 'your@email.com';
